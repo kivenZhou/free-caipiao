@@ -17,6 +17,37 @@ function parseTips(raw: string | null): TipSnapshot[] {
   }
 }
 
+function tipKey(t: TipSnapshot): string {
+  return `${t.targetIssue}:${t.pageSize}`;
+}
+
+/** 合并多份存档，同一目标期+范围保留最早 createdAt 的记录 */
+function mergeTips(...lists: TipSnapshot[][]): TipSnapshot[] {
+  const map = new Map<string, TipSnapshot>();
+  for (const list of lists) {
+    for (const t of list) {
+      const key = tipKey(t);
+      const existing = map.get(key);
+      if (!existing || t.createdAt < existing.createdAt) {
+        map.set(key, t);
+      }
+    }
+  }
+  return [...map.values()].sort((a, b) => {
+    const byIssue = b.targetIssue.localeCompare(a.targetIssue);
+    return byIssue !== 0 ? byIssue : a.pageSize - b.pageSize;
+  });
+}
+
+async function readLocalTips(): Promise<TipSnapshot[]> {
+  try {
+    await ensureLocalStore();
+    return parseTips(await fs.readFile(TIPS_FILE, "utf8"));
+  } catch {
+    return [];
+  }
+}
+
 async function getKv(): Promise<KVNamespace | null> {
   try {
     const { env } = await getCloudflareContext();
@@ -47,7 +78,10 @@ async function ensureLocalStore(): Promise<void> {
 export async function readTips(): Promise<TipSnapshot[]> {
   const kv = await getKv();
   if (kv) {
-    return parseTips(await kv.get(TIPS_KEY));
+    const fromKv = parseTips(await kv.get(TIPS_KEY));
+    const fromFile = await readLocalTips();
+    // dev 下 initOpenNextCloudflareForDev 会启用 KV，但历史存档可能只在 data/tips.json
+    return fromFile.length ? mergeTips(fromKv, fromFile) : fromKv;
   }
 
   if (await isOnCloudflare()) {
@@ -55,9 +89,7 @@ export async function readTips(): Promise<TipSnapshot[]> {
     return [];
   }
 
-  await ensureLocalStore();
-  const raw = await fs.readFile(TIPS_FILE, "utf8");
-  return parseTips(raw);
+  return readLocalTips();
 }
 
 export async function writeTips(tips: TipSnapshot[]): Promise<void> {
@@ -65,15 +97,16 @@ export async function writeTips(tips: TipSnapshot[]): Promise<void> {
   const kv = await getKv();
   if (kv) {
     await kv.put(TIPS_KEY, payload);
+  } else if (await isOnCloudflare()) {
     return;
   }
 
-  if (await isOnCloudflare()) {
-    return;
+  try {
+    await ensureLocalStore();
+    await fs.writeFile(TIPS_FILE, payload, "utf8");
+  } catch {
+    // 生产 Workers 无本地文件系统
   }
-
-  await ensureLocalStore();
-  await fs.writeFile(TIPS_FILE, payload, "utf8");
 }
 
 /**
