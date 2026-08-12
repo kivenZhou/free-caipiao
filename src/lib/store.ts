@@ -26,6 +26,15 @@ async function getKv(): Promise<KVNamespace | null> {
   }
 }
 
+async function isOnCloudflare(): Promise<boolean> {
+  try {
+    await getCloudflareContext();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function ensureLocalStore(): Promise<void> {
   await fs.mkdir(DATA_DIR, { recursive: true });
   try {
@@ -41,6 +50,11 @@ export async function readTips(): Promise<TipSnapshot[]> {
     return parseTips(await kv.get(TIPS_KEY));
   }
 
+  if (await isOnCloudflare()) {
+    // Workers 上未绑定 KV 时降级，避免 fs 报错
+    return [];
+  }
+
   await ensureLocalStore();
   const raw = await fs.readFile(TIPS_FILE, "utf8");
   return parseTips(raw);
@@ -51,6 +65,10 @@ export async function writeTips(tips: TipSnapshot[]): Promise<void> {
   const kv = await getKv();
   if (kv) {
     await kv.put(TIPS_KEY, payload);
+    return;
+  }
+
+  if (await isOnCloudflare()) {
     return;
   }
 
