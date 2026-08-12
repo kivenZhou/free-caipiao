@@ -95,7 +95,7 @@ export default function LotteryApp() {
   const fetchTips = useCallback(async () => {
     try {
       const res = await fetch("/api/tips");
-      const json = await res.json();
+      const json = (await res.json()) as { ok?: boolean; tips?: TipSnapshot[] };
       if (json.ok) setTips(json.tips as TipSnapshot[]);
     } catch {
       /* ignore */
@@ -107,7 +107,10 @@ export default function LotteryApp() {
   const fetchDrawLookup = useCallback(async () => {
     try {
       const res = await fetch("/api/lottery?pageSize=1555");
-      const json = await res.json();
+      const json = (await res.json()) as {
+        state?: number;
+        result?: LotteryRecord[];
+      };
       if (json.state === 0) {
         setDrawLookup(parseRecords(json.result as LotteryRecord[]));
       }
@@ -122,7 +125,10 @@ export default function LotteryApp() {
     try {
       const res = await fetch(`/api/lottery?pageSize=${pageSize}`);
       if (!res.ok) throw new Error(`请求失败 (${res.status})`);
-      const json = await res.json();
+      const json = (await res.json()) as {
+        state?: number;
+        result?: LotteryRecord[];
+      };
       if (json.state !== 0) throw new Error("福彩接口返回错误");
       setRecords(parseRecords(json.result as LotteryRecord[]));
       setFetchedPageSize(pageSize);
@@ -174,7 +180,7 @@ export default function LotteryApp() {
           strategies: tipPackage.strategies,
         }),
       });
-      const json = await res.json();
+      const json = (await res.json()) as { ok?: boolean };
       if (json.ok) {
         setSaveMsg(`已存档目标期 ${targetIssue}（近${pageSize}期）`);
         await fetchTips();

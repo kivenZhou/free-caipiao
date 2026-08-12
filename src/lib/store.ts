@@ -1,11 +1,32 @@
 import { promises as fs } from "fs";
 import path from "path";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
 import type { TipSnapshot } from "./types";
 
+const TIPS_KEY = "tips";
 const DATA_DIR = path.join(process.cwd(), "data");
 const TIPS_FILE = path.join(DATA_DIR, "tips.json");
 
-async function ensureStore(): Promise<void> {
+function parseTips(raw: string | null): TipSnapshot[] {
+  if (!raw) return [];
+  try {
+    const data = JSON.parse(raw) as TipSnapshot[];
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+async function getKv(): Promise<KVNamespace | null> {
+  try {
+    const { env } = await getCloudflareContext();
+    return (env as CloudflareEnv).TIPS_KV ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function ensureLocalStore(): Promise<void> {
   await fs.mkdir(DATA_DIR, { recursive: true });
   try {
     await fs.access(TIPS_FILE);
@@ -15,19 +36,26 @@ async function ensureStore(): Promise<void> {
 }
 
 export async function readTips(): Promise<TipSnapshot[]> {
-  await ensureStore();
-  const raw = await fs.readFile(TIPS_FILE, "utf8");
-  try {
-    const data = JSON.parse(raw) as TipSnapshot[];
-    return Array.isArray(data) ? data : [];
-  } catch {
-    return [];
+  const kv = await getKv();
+  if (kv) {
+    return parseTips(await kv.get(TIPS_KEY));
   }
+
+  await ensureLocalStore();
+  const raw = await fs.readFile(TIPS_FILE, "utf8");
+  return parseTips(raw);
 }
 
 export async function writeTips(tips: TipSnapshot[]): Promise<void> {
-  await ensureStore();
-  await fs.writeFile(TIPS_FILE, JSON.stringify(tips, null, 2), "utf8");
+  const payload = JSON.stringify(tips, null, 2);
+  const kv = await getKv();
+  if (kv) {
+    await kv.put(TIPS_KEY, payload);
+    return;
+  }
+
+  await ensureLocalStore();
+  await fs.writeFile(TIPS_FILE, payload, "utf8");
 }
 
 /**
