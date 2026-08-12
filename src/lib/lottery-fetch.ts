@@ -1,20 +1,16 @@
-import type { LotteryRecord } from "./types";
+import type { LotteryApiResponse, LotteryRecord } from "./types";
+import {
+  isOnCloudflare,
+  readBundledFallback,
+  readLotteryCache,
+  writeLotteryCache,
+} from "./lottery-cache";
 
 const CWL_API =
   "https://www.cwl.gov.cn/cwl_admin/front/cwlkj/search/kjxx/findDrawNotice";
 
 const MIRROR_API =
   "https://api.huiniao.top/interface/home/lotteryHistory";
-
-export interface LotteryApiResponse {
-  state: number;
-  message: string;
-  total: number;
-  pageNo: number;
-  pageSize: number;
-  result: LotteryRecord[];
-  source?: "cwl" | "mirror";
-}
 
 type HuiniaoItem = {
   code: string;
@@ -27,6 +23,10 @@ type HuiniaoItem = {
   six: string;
   seven: string;
 };
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function pad2(n: string | number): string {
   return String(n).padStart(2, "0");
@@ -41,6 +41,24 @@ function mapHuiniaoItem(item: HuiniaoItem): LotteryRecord {
     date: item.day,
     red: reds,
     blue: pad2(item.seven),
+  };
+}
+
+function buildResponse(
+  pageSize: number,
+  pageNo: number,
+  result: LotteryRecord[],
+  message: string,
+  source: LotteryApiResponse["source"]
+): LotteryApiResponse {
+  return {
+    state: 0,
+    message,
+    total: result.length,
+    pageNo,
+    pageSize,
+    result,
+    source,
   };
 }
 
@@ -83,7 +101,10 @@ async function fetchFromOfficial(
   return { ...data, source: "cwl" };
 }
 
-async function fetchHuiniaoPage(page: number, limit: number): Promise<HuiniaoItem[]> {
+async function fetchHuiniaoPage(
+  page: number,
+  limit: number
+): Promise<HuiniaoItem[]> {
   const url = new URL(MIRROR_API);
   url.searchParams.set("type", "ssq");
   url.searchParams.set("page", String(page));
@@ -93,13 +114,13 @@ async function fetchHuiniaoPage(page: number, limit: number): Promise<HuiniaoIte
     headers: {
       Accept: "application/json",
       "User-Agent":
-        "Mozilla/5.0 (compatible; free-caipiao/1.0; +https://github.com/)",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     },
     cache: "no-store",
   });
 
   if (!res.ok) {
-    throw new Error(`mirror ${res.status}`);
+    throw new Error(`mirror http ${res.status}`);
   }
 
   const json = (await res.json()) as {
@@ -115,57 +136,100 @@ async function fetchHuiniaoPage(page: number, limit: number): Promise<HuiniaoIte
   return json.data?.data?.list ?? [];
 }
 
-/** 备用源分页拉取，合并为与福彩官网一致的结构 */
+/** 串行分页 + 重试，避免备用源限流 */
 async function fetchFromMirror(
   pageSize: number,
   pageNo: number
 ): Promise<LotteryApiResponse> {
   const limit = 100;
-  const startPage = pageNo;
   const pagesNeeded = Math.ceil(pageSize / limit);
-  const pageNumbers = Array.from(
-    { length: pagesNeeded },
-    (_, i) => startPage + i
-  );
+  const merged: HuiniaoItem[] = [];
 
-  const chunks = await Promise.all(
-    pageNumbers.map((page) => fetchHuiniaoPage(page, limit))
-  );
-  const merged = chunks.flat().slice(0, pageSize);
+  for (let i = 0; i < pagesNeeded; i++) {
+    const page = pageNo + i;
+    let lastErr: unknown;
+    let items: HuiniaoItem[] | null = null;
 
-  if (!merged.length) {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        items = await fetchHuiniaoPage(page, limit);
+        break;
+      } catch (err) {
+        lastErr = err;
+        await sleep(500 * (attempt + 1));
+      }
+    }
+
+    if (!items) {
+      throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+    }
+
+    merged.push(...items);
+    if (i < pagesNeeded - 1) {
+      await sleep(350);
+    }
+  }
+
+  const result = merged.slice(0, pageSize).map(mapHuiniaoItem);
+  if (!result.length) {
     throw new Error("mirror returned empty list");
   }
 
-  return {
-    state: 0,
-    message: "查询成功（备用数据源）",
-    total: merged.length,
-    pageNo,
+  return buildResponse(
     pageSize,
-    result: merged.map(mapHuiniaoItem),
-    source: "mirror",
-  };
+    pageNo,
+    result,
+    "查询成功（备用数据源）",
+    "mirror"
+  );
+}
+
+async function fetchLive(
+  pageSize: number,
+  pageNo: number
+): Promise<LotteryApiResponse> {
+  const onCf = await isOnCloudflare();
+
+  if (!onCf) {
+    try {
+      return await fetchFromOfficial(pageSize, pageNo);
+    } catch {
+      /* 本地开发失败再试备用源 */
+    }
+  }
+
+  return fetchFromMirror(pageSize, pageNo);
 }
 
 /**
- * 拉取双色球历史：
- * 1. 优先福彩官网（本地开发通常可用）
- * 2. Cloudflare 等海外节点常被 WAF 403 → 自动切备用源
+ * 拉取双色球历史（带 KV 缓存 + 内置快照兜底）
  */
 export async function fetchLotteryData(
   pageSize: number,
   pageNo: number
 ): Promise<LotteryApiResponse> {
+  const cached = await readLotteryCache(pageSize, pageNo);
+  if (cached) {
+    return { ...cached, source: "cache" };
+  }
+
   try {
-    return await fetchFromOfficial(pageSize, pageNo);
-  } catch (officialErr) {
-    try {
-      return await fetchFromMirror(pageSize, pageNo);
-    } catch (mirrorErr) {
-      throw new Error(
-        `official failed: ${String(officialErr)}; mirror failed: ${String(mirrorErr)}`
-      );
+    const data = await fetchLive(pageSize, pageNo);
+    await writeLotteryCache(pageSize, pageNo, data);
+    return data;
+  } catch (liveErr) {
+    const stale = await readLotteryCache(pageSize, pageNo);
+    if (stale) {
+      return { ...stale, source: "cache", message: `${stale.message}（缓存）` };
     }
+
+    const bundled = readBundledFallback(pageSize, pageNo);
+    if (bundled.result.length) {
+      return bundled;
+    }
+
+    throw liveErr;
   }
 }
+
+export type { LotteryApiResponse };

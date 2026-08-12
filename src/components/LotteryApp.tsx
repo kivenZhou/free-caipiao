@@ -145,8 +145,13 @@ export default function LotteryApp() {
 
   useEffect(() => {
     fetchTips();
-    fetchDrawLookup();
-  }, [fetchTips, fetchDrawLookup]);
+  }, [fetchTips]);
+
+  // 全量历史仅在复盘页需要，避免首页同时打 300+1555 触发限流
+  useEffect(() => {
+    if (tab !== "review" || drawLookup.length) return;
+    void fetchDrawLookup();
+  }, [tab, drawLookup.length, fetchDrawLookup]);
 
   const tipPackage = useMemo(
     () => (records.length ? buildTipPackage(records) : null),

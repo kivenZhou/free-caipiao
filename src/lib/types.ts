@@ -7,6 +7,16 @@ export interface LotteryRecord {
   poolmoney?: string; // 奖池金额
 }
 
+export interface LotteryApiResponse {
+  state: number;
+  message: string;
+  total: number;
+  pageNo: number;
+  pageSize: number;
+  result: LotteryRecord[];
+  source?: "cwl" | "mirror" | "bundled" | "cache";
+}
+
 export interface ParsedRecord {
   code: string;
   date: string;
