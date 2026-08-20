@@ -140,13 +140,21 @@ function buildCandidatePool(records: ParsedRecord[]): {
   const maxFreq = Math.max(...freq.map((f) => f.count)) || 1;
   const maxMiss = Math.max(...redMiss.slice(1, 34)) || 1;
 
+  const centrality = buildNumberPairCentrality(records);
+  const maxCentrality = Math.max(...centrality.slice(1, 34)) || 1;
+
   const ranked = freq.map((f) => {
     const freqScore = f.count / maxFreq;
     const recentScore = recentCounts[f.number] / maxRecent;
     const missScore = redMiss[f.number] / maxMiss;
-    // 均匀底线 1.0；历史/近期各 0.12；遗漏仅 0.05
+    const pairScore = centrality[f.number] / maxCentrality;
+    // 均匀底线 + 频率/近期/遗漏/共现对子，略加强历史共现权重
     const score =
-      1.0 + freqScore * 0.12 + recentScore * 0.12 + missScore * 0.05;
+      1.0 +
+      freqScore * 0.15 +
+      recentScore * 0.18 +
+      missScore * 0.06 +
+      pairScore * 0.12;
     return { number: f.number, score };
   });
 
@@ -191,9 +199,20 @@ function weightedSample(
   return picked.sort((a, b) => a - b);
 }
 
-/** 单号在 5 注中最多出现次数；目标并集覆盖 */
-const MAX_APPEARANCES = 2;
-const MIN_UNIQUE_TARGET = 24;
+/** 5 注套餐：每号最多 1 次 → 30 个不同红球，最大化覆盖 */
+function getCoverageParams(count: number): {
+  maxAppearances: number;
+  minUnique: number;
+  monteCarloIters: number;
+} {
+  if (count <= 5) {
+    return { maxAppearances: 1, minUnique: Math.min(30, count * 6), monteCarloIters: 400 };
+  }
+  if (count <= 8) {
+    return { maxAppearances: 2, minUnique: Math.min(33, count * 6 - 3), monteCarloIters: 180 };
+  }
+  return { maxAppearances: 3, minUnique: 33, monteCarloIters: 80 };
+}
 
 /**
  * 按「剩余配额」调整权重后抽样 6 红球。
@@ -203,11 +222,12 @@ function pickReds(
   ranked: { number: number; score: number }[],
   avgSum: number,
   noteSeed: number,
-  usage: Map<number, number>
+  usage: Map<number, number>,
+  maxAppearances: number
 ): number[] {
   const baseWeights = ranked.map((r) => {
     const used = usage.get(r.number) ?? 0;
-    if (used >= MAX_APPEARANCES) return { number: r.number, weight: 0 };
+    if (used >= maxAppearances) return { number: r.number, weight: 0 };
     // 未用过的略抬高，已用过一次的压低 → 推高五注并集
     const diversify = used === 0 ? 1.35 : 0.35;
     return { number: r.number, weight: r.score * diversify };
@@ -267,9 +287,13 @@ function uniqueCount(notes: number[][]): number {
 /**
  * 若并集仍偏窄，用未出现号替换各注中的「高重复号」。
  */
-function expandCoverage(notes: number[][], avgSum: number): number[][] {
+function expandCoverage(
+  notes: number[][],
+  avgSum: number,
+  minUniqueTarget: number
+): number[][] {
   const result = notes.map((n) => [...n]);
-  if (uniqueCount(result) >= MIN_UNIQUE_TARGET) return result;
+  if (uniqueCount(result) >= minUniqueTarget) return result;
 
   const count = new Map<number, number>();
   for (const note of result) {
@@ -280,8 +304,8 @@ function expandCoverage(notes: number[][], avgSum: number): number[][] {
     (n) => !count.has(n)
   );
 
-  for (let guard = 0; guard < 40 && missing.length > 0; guard++) {
-    if (uniqueCount(result) >= MIN_UNIQUE_TARGET) break;
+  for (let guard = 0; guard < 60 && missing.length > 0; guard++) {
+    if (uniqueCount(result) >= minUniqueTarget) break;
 
     // 找出现次数最多的号所在注，换成未出现号
     let heavy = 0;
@@ -415,8 +439,173 @@ export function scoreEnsembleCombination(
   return { totalScore, markovScore, acValue, sameTail, gaussianScore };
 }
 
+/** 近 N 期红球两两共现频次 */
+function buildPairCooccurrenceMap(
+  records: ParsedRecord[],
+  window = 120
+): Map<string, number> {
+  const pairMap = new Map<string, number>();
+  const slice = records.slice(0, Math.min(window, records.length));
+  for (const r of slice) {
+    const sorted = [...r.reds].sort((a, b) => a - b);
+    for (let i = 0; i < sorted.length; i++) {
+      for (let j = i + 1; j < sorted.length; j++) {
+        const key = `${sorted[i]}-${sorted[j]}`;
+        pairMap.set(key, (pairMap.get(key) ?? 0) + 1);
+      }
+    }
+  }
+  return pairMap;
+}
+
+/** 号码在热门对子中的参与度 */
+function buildNumberPairCentrality(records: ParsedRecord[]): number[] {
+  const pairMap = buildPairCooccurrenceMap(records);
+  const centrality = new Array(34).fill(0);
+  for (const [key, count] of pairMap) {
+    const [a, b] = key.split("-").map(Number);
+    centrality[a] += count;
+    centrality[b] += count;
+  }
+  return centrality;
+}
+
+/** 单注内对子与历史共现的契合度 */
+function calcBetPairCoherence(
+  notes: number[][],
+  records: ParsedRecord[]
+): number {
+  const pairMap = buildPairCooccurrenceMap(records);
+  let score = 0;
+  for (const note of notes) {
+    for (let i = 0; i < note.length; i++) {
+      for (let j = i + 1; j < note.length; j++) {
+        const a = Math.min(note[i], note[j]);
+        const b = Math.max(note[i], note[j]);
+        score += Math.log1p(pairMap.get(`${a}-${b}`) ?? 0);
+      }
+    }
+  }
+  return score;
+}
+
+/** 为 N 注分配互异蓝球，优先高频+遗漏组合 */
+function assignBlues(
+  count: number,
+  blueScores: { number: number; score: number }[],
+  seed: number
+): number[] {
+  if (count >= 16) {
+    return Array.from({ length: count }, (_, i) => (i % 16) + 1);
+  }
+
+  const rand = seededRandom(seed * 7919 + 17);
+  const topPool = blueScores.slice(0, Math.min(10, blueScores.length));
+  const used = new Set<number>();
+  const blues: number[] = [];
+
+  for (let i = 0; i < count; i++) {
+    const candidates = topPool.filter((b) => !used.has(b.number));
+    const pool =
+      candidates.length > 0
+        ? candidates
+        : blueScores.filter((b) => !used.has(b.number));
+    if (pool.length === 0) {
+      used.clear();
+      blues.push(blueScores[i % blueScores.length].number);
+      continue;
+    }
+    // 前几注偏高分，后续略随机化避免固定模式
+    const pick =
+      i < 3 ? pool[0] : pool[Math.floor(rand() * Math.min(3, pool.length))];
+    blues.push(pick.number);
+    used.add(pick.number);
+  }
+  return blues;
+}
+
+/** 评估整套方案的覆盖与结构质量（用于蒙特卡洛优选） */
+function scorePackageQuality(
+  notes: number[][],
+  blues: number[],
+  records: ParsedRecord[],
+  markovMatrix: number[][]
+): number {
+  let score = uniqueCount(notes) * 5;
+
+  const freq = redFrequency(records);
+  const freqMap = new Map(freq.map((f) => [f.number, f.percentage]));
+  for (const n of new Set(notes.flat())) {
+    score += (freqMap.get(n) ?? 0) * 0.4;
+  }
+
+  for (let i = 0; i < notes.length; i++) {
+    score += scoreEnsembleCombination(
+      notes[i],
+      blues[i] ?? blues[0],
+      records,
+      markovMatrix
+    ).totalScore;
+  }
+
+  score += new Set(blues).size * 10;
+  score += calcBetPairCoherence(notes, records) * 2;
+
+  // 三区并集覆盖奖励
+  const all = notes.flat();
+  const z1 = all.some((n) => n <= 11);
+  const z2 = all.some((n) => n >= 12 && n <= 22);
+  const z3 = all.some((n) => n >= 23);
+  if (z1 && z2 && z3) score += 15;
+
+  return score;
+}
+
+/** 生成单套候选方案 */
+function generateCandidatePackage(
+  records: ParsedRecord[],
+  count: number,
+  ranked: { number: number; score: number }[],
+  sumAvg: number,
+  blueScores: { number: number; score: number }[],
+  coverage: ReturnType<typeof getCoverageParams>,
+  seed: number
+): { notes: number[][]; blues: number[] } {
+  const usage = new Map<number, number>();
+  const rawNotes: number[][] = [];
+  for (let i = 0; i < count; i++) {
+    const reds = pickReds(
+      ranked,
+      sumAvg,
+      seed * 1000 + i + 1,
+      usage,
+      coverage.maxAppearances
+    );
+    rawNotes.push(reds);
+    for (const n of reds) usage.set(n, (usage.get(n) ?? 0) + 1);
+  }
+  const notes = expandCoverage(rawNotes, sumAvg, coverage.minUnique);
+  const blues = assignBlues(count, blueScores, seed);
+  return { notes, blues };
+}
+
+/** 套餐覆盖统计（供 UI 展示） */
+export function getPackageCoverageStats(notes: number[][], blues: number[]): {
+  uniqueReds: number;
+  blueCoveragePct: number;
+  redCoveragePct: number;
+} {
+  const uniqueReds = uniqueCount(notes);
+  const distinctBlues = new Set(blues).size;
+  return {
+    uniqueReds,
+    blueCoveragePct: Number(((distinctBlues / 16) * 100).toFixed(1)),
+    redCoveragePct: Number(((uniqueReds / 33) * 100).toFixed(1)),
+  };
+}
+
 /**
- * 基于 1500+ 期全量大数据库 + 蒙特卡洛 10,000 次多模型融合搜索算法生成 5 注推荐号码
+ * 基于全量大数据库 + 蒙特卡洛多模型融合搜索生成推荐号码
  */
 export function predictMultiple(
   records: ParsedRecord[],
@@ -447,30 +636,54 @@ export function predictMultiple(
       number: f.number,
       score:
         1.0 +
-        (f.count / maxBlueFreq) * 0.2 +
-        (blueMiss[f.number] / maxBlueMiss) * 0.05,
+        (f.count / maxBlueFreq) * 0.25 +
+        (blueMiss[f.number] / maxBlueMiss) * 0.08,
     }))
     .sort((a, b) => b.score - a.score);
 
-  // 贪心约束抽样：逐注生成 + 多轮重试 + 覆盖率扩展，确保五注结构分散
-  const usage = new Map<number, number>();
-  const rawNotes: number[][] = [];
-  for (let i = 0; i < count; i++) {
-    const reds = pickReds(ranked, sumAvg, i + 1, usage);
-    rawNotes.push(reds);
-    for (const n of reds) usage.set(n, (usage.get(n) ?? 0) + 1);
-  }
-  const coveredNotes = expandCoverage(rawNotes, sumAvg);
+  const coverage = getCoverageParams(count);
 
-  const usedBlues = new Set<number>();
-  return coveredNotes.slice(0, count).map((reds, i) => {
-    let blue = blueScores.find((b) => !usedBlues.has(b.number))?.number;
-    if (!blue) {
-      usedBlues.clear();
-      blue = blueScores[0].number;
+  // 蒙特卡洛搜索：生成多套候选，取得分最高的一套
+  let best = generateCandidatePackage(
+    records,
+    count,
+    ranked,
+    sumAvg,
+    blueScores,
+    coverage,
+    1
+  );
+  let bestScore = scorePackageQuality(
+    best.notes,
+    best.blues,
+    records,
+    markovMatrix
+  );
+
+  for (let iter = 2; iter <= coverage.monteCarloIters; iter++) {
+    const candidate = generateCandidatePackage(
+      records,
+      count,
+      ranked,
+      sumAvg,
+      blueScores,
+      coverage,
+      iter
+    );
+    const candidateScore = scorePackageQuality(
+      candidate.notes,
+      candidate.blues,
+      records,
+      markovMatrix
+    );
+    if (candidateScore > bestScore) {
+      best = candidate;
+      bestScore = candidateScore;
     }
-    usedBlues.add(blue);
+  }
 
+  return best.notes.slice(0, count).map((reds, i) => {
+    const blue = best.blues[i] ?? best.blues[0];
     const ensemble = scoreEnsembleCombination(reds, blue, records, markovMatrix);
 
     return {
@@ -478,8 +691,8 @@ export function predictMultiple(
       blue,
       method:
         i === 0
-          ? "全量马尔可夫转移 + AC复杂度滤波 + 高斯贝叶斯 + 蒙特卡洛优选"
-          : `多模型融合变种${i + 1}`,
+          ? `蒙特卡洛${coverage.monteCarloIters}轮优选 · 覆盖${uniqueCount(best.notes)}红 · 共现对子+马尔可夫+AC`
+          : `融合变种第${i + 1}注`,
       markovScore: ensemble.markovScore,
       acValue: ensemble.acValue,
       sameTail: ensemble.sameTail,

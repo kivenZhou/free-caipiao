@@ -37,6 +37,7 @@ import {
   runBacktest,
   generate16BlueFullPackage,
   generateHighAntiCollisionPackage,
+  getPackageCoverageStats,
   calcACValue,
   hasSameTail,
   calcRunsTest,
@@ -426,6 +427,24 @@ function PredictTab({
     }));
   }, [activePackage, predictions, blue16Package, antiCollisionPackage]);
 
+  const coverageStats = useMemo(
+    () =>
+      getPackageCoverageStats(
+        activeBets.map((b) => b.reds),
+        activeBets.map((b) => b.blue)
+      ),
+    [activeBets]
+  );
+
+  const compositeCoverage = useMemo(
+    () =>
+      getPackageCoverageStats(
+        predictions.map((p) => p.reds),
+        predictions.map((p) => p.blue)
+      ),
+    [predictions]
+  );
+
   function analyzeNote(reds: number[]) {
     const sum = reds.reduce((s, n) => s + n, 0);
     const odd = reds.filter((n) => n % 2 === 1).length;
@@ -469,7 +488,7 @@ function PredictTab({
           label="综合蓝球参考"
           value={`${predictions[0]?.blue ?? "-"}`}
           unit="号"
-          sub="均匀底线 + 轻频率倾斜；5注蓝球互异"
+          sub={`覆盖${compositeCoverage.uniqueReds}红 · 蓝球池${compositeCoverage.blueCoveragePct}%`}
           blue
         />
         <StatCard label="最冷红球" value={`${coldRed?.number ?? "-"}`} unit="号" sub={`出现 ${coldRed?.count ?? 0} 次`} muted />
@@ -543,7 +562,7 @@ function PredictTab({
           >
             <p className="text-xs font-semibold text-white">🔥 AI 精选 5 注 (10元预算)</p>
             <p className="text-[10px] text-gray-400 mt-1">
-              全号覆盖 $\ge 24$ · 5个热门蓝球 · 蓝球命中率 31.25%
+              蒙特卡洛优选 · 覆盖{compositeCoverage.uniqueReds}红({compositeCoverage.redCoveragePct}%) · 蓝球池{compositeCoverage.blueCoveragePct}%
             </p>
           </button>
 
